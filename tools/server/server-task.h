@@ -94,6 +94,8 @@ struct task_params {
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
+    std::map<std::string, float> steering; // steering vector name -> scale, see STEERING.md
+
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 
@@ -427,6 +429,9 @@ struct server_task_result_cmpl_final : server_task_result {
 
     task_params generation_params;
 
+    // applied steering: {"name": {"scale": s, "hash": h}, ...}, null if the request has no steering field
+    json steering;
+
     // response formatting
     bool               verbose  = false;
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;
@@ -447,6 +452,8 @@ struct server_task_result_cmpl_final : server_task_result {
     }
 
     virtual json to_json() override;
+
+    json to_json_impl();
 
     virtual void update(task_result_state & state) override {
         is_updated = true;

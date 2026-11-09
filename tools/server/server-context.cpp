@@ -11,6 +11,7 @@
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-steering.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -389,6 +390,76 @@ struct server_slot {
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
+    // per-request steering, see STEERING.md
+    // the row of this slot in the per-sequence control vector table is written when the slot starts generating, so
+    // the prompt is never steered, and is zeroed on release
+    bool    steering_enabled  = false; // the context has per-sequence control vector tables
+    int32_t steering_il_start = 1;
+    int32_t steering_il_end   = 0;
+
+    server_steering_mix steering;
+
+    bool      steering_pending   = false; // the row must be written at the next generation step
+    int32_t   steering_n_tokens  = -1;    // number of tokens in the cache when the steered generation started, -1 if not steered
+    llama_pos steering_pos       = -1;    // position of the first steered token
+    bool      steering_ctx_shift = false; // the context was shifted during the steered generation
+
+    // prompt -> generation transition: the prompt has been decoded and the first token sampled
+    void steering_apply() {
+        steering_pending = false;
+        if (!steering_enabled) {
+            return;
+        }
+
+        const int32_t n_embd = llama_model_n_embd(llama_get_model(ctx_tgt));
+
+        if (steering.empty()) {
+            llama_set_adapter_cvec_seq(ctx_tgt, id, nullptr, 0, n_embd, 0, 0);
+            return;
+        }
+
+        if (llama_set_adapter_cvec_seq(ctx_tgt, id, steering.data.data(), steering.data.size(), n_embd, steering_il_start, steering_il_end) != 0) {
+            SLT_ERR(*this, "%s", "failed to set the steering vector\n");
+            return;
+        }
+
+        steering_n_tokens  = prompt.n_tokens();
+        steering_pos       = prompt.tokens.pos_next();
+        steering_ctx_shift = false;
+
+        SLT_DBG(*this, "steering from n_tokens = %d: %s\n", steering_n_tokens, steering.info.dump().c_str());
+    }
+
+    void steering_release() {
+        steering_pending = false;
+        if (steering_n_tokens < 0) {
+            return;
+        }
+
+        const int32_t n_embd = llama_model_n_embd(llama_get_model(ctx_tgt));
+        llama_set_adapter_cvec_seq(ctx_tgt, id, nullptr, 0, n_embd, 0, 0);
+
+        // the KV of the generated tokens was computed with steering: drop it, so that a later request that has this
+        // reply in its prompt computes it unsteered, the same as a cold prefill
+        if (steering_ctx_shift) {
+            prompt_clear();
+        } else if (prompt.n_tokens() > steering_n_tokens) {
+            bool ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, steering_pos, -1);
+            if (ok && ctx_dft) {
+                ok = llama_memory_seq_rm(llama_get_memory(ctx_dft), id, steering_pos, -1);
+            }
+            if (ok) {
+                SLT_DBG(*this, "dropping %d steered tokens from the cache\n", prompt.n_tokens() - steering_n_tokens);
+                prompt.tokens.keep_first(steering_n_tokens);
+            } else {
+                prompt_clear();
+            }
+        }
+
+        steering_n_tokens = -1;
+        steering_pos      = -1;
+    }
+
     // sampling
     json json_schema;
 
@@ -677,6 +748,8 @@ struct server_slot {
                 prompt_clear();
             }
 
+            steering_release();
+
             callback_on_reset(*this);
 
             reset();
@@ -826,6 +899,9 @@ struct server_slot {
             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
             res["params"] = ptask->params.to_json(only_metrics);
+            if (task && !steering.info.is_null()) {
+                res["steering"] = steering.info;
+            }
             res["next_token"] = json::array({
                 {
                     {"has_next_token", has_next_token},
@@ -1027,6 +1103,10 @@ public:
 
     mtmd_context * mctx = nullptr;
     mtmd_helper_cap mtmd_cap = {};
+
+    // named steering vectors, thread-safe
+    server_steering_registry steering;
+    bool steering_enabled = false; // the target context has per-sequence control vector tables
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
@@ -1305,6 +1385,10 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // per-request steering needs the per-sequence control vector tables, allocated with the context
+        steering_enabled = params_base.steering || !params_base.steering_vectors.empty();
+        params_base.cvec_seq = steering_enabled;
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1321,6 +1405,17 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        for (const auto & [name, path] : params_base.steering_vectors) {
+            try {
+                auto vec = server_steering_registry::load(name, path, llama_model_n_embd(model_tgt), llama_model_n_layer(model_tgt));
+                SRV_INF("loaded steering vector '%s' from '%s' (sha256 %s)\n", name.c_str(), path.c_str(), vec.hash.c_str());
+                steering.add(std::move(vec));
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to load steering vector: %s\n", e.what());
+                return false;
+            }
+        }
 
         try {
             decision.init(model_tgt);
@@ -1524,6 +1619,10 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
+
+            slot.steering_enabled  = steering_enabled;
+            slot.steering_il_start = params_base.control_vector_layer_start > 0 ? params_base.control_vector_layer_start : 1;
+            slot.steering_il_end   = params_base.control_vector_layer_end   > 0 ? params_base.control_vector_layer_end   : llama_model_n_layer(model_tgt);
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
@@ -1952,6 +2051,12 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // mix the steering vectors once per task, the row is written when the generation starts
+        slot.steering = {};
+        if (!task.params.steering.empty()) {
+            slot.steering = steering.mix(task.params.steering);
+        }
+        slot.steering_pending = slot.steering_enabled;
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2427,6 +2532,7 @@ private:
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
+        res->steering        = slot.steering.info;
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
@@ -3841,6 +3947,7 @@ private:
                 }
 
                 slot.truncated = true;
+                slot.steering_ctx_shift = true;
             }
         });
 
@@ -3871,6 +3978,11 @@ private:
             }
 
             generating.push_back(&slot);
+
+            // the prompt of this slot has been decoded and its first token sampled: start steering
+            if (slot.steering_pending) {
+                slot.steering_apply();
+            }
 
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
@@ -5393,6 +5505,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
 
+            if (!task.params.steering.empty()) {
+                if (!ctx_server.steering_enabled) {
+                    throw std::invalid_argument("steering is not enabled, start the server with --steering-vector or --steering");
+                }
+                ctx_server.steering.validate(task.params.steering);
+            }
+
             task.apply_chat_session(chat_session);
 
             task.id_slot = json_value(data, "id_slot", -1);
@@ -6773,6 +6892,56 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_get_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_steering_vectors = [this](const server_http_req &) {
+        auto res = create_response();
+        res->ok(json{
+            {"enabled", ctx_server.steering_enabled},
+            {"vectors", ctx_server.steering.to_json()},
+        });
+        return res;
+    };
+
+    this->post_steering_vectors = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!ctx_server.steering_enabled) {
+            res->error(format_error_response("steering is not enabled, start the server with --steering-vector or --steering", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (ctx_server.model_tgt == nullptr) {
+            res->error(format_error_response("model is not loaded", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+        const std::string name = json_value(body, "name", std::string());
+        const std::string path = json_value(body, "path", std::string());
+        if (name.empty() || path.empty()) {
+            res->error(format_error_response("'name' and 'path' are required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // the file is read here, the registry is thread-safe and the main loop mixes the vectors under its lock
+        server_steering_vector vec;
+        try {
+            vec = server_steering_registry::load(name, path, llama_model_n_embd(ctx_server.model_tgt), llama_model_n_layer(ctx_server.model_tgt));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string hash = vec.hash;
+        const bool replaced = ctx_server.steering.add(std::move(vec));
+        SRV_INF("%s steering vector '%s' from '%s' (sha256 %s)\n", replaced ? "replaced" : "registered", name.c_str(), path.c_str(), hash.c_str());
+
+        res->ok(json{
+            {"name",     name},
+            {"path",     path},
+            {"hash",     hash},
+            {"replaced", replaced},
+        });
         return res;
     };
 

@@ -209,6 +209,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
+    // per-request steering vectors
+    ctx_http.get ("/steering-vectors",         ex_wrapper(routes.get_steering_vectors));
+    ctx_http.post("/steering-vectors",         ex_wrapper(routes.post_steering_vectors));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
@@ -519,6 +522,8 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.post_responses_tok_oai      = models_routes->proxy_post;
     routes.get_lora_adapters           = models_routes->proxy_get;
     routes.post_lora_adapters          = models_routes->proxy_post;
+    routes.get_steering_vectors        = models_routes->proxy_get;
+    routes.post_steering_vectors       = models_routes->proxy_post;
     routes.get_slots                   = models_routes->proxy_get;
     routes.post_slots                  = models_routes->proxy_post;
 

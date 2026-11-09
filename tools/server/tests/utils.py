@@ -98,6 +98,8 @@ class ServerProcess:
     models_preset: str | None = None
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
+    steering_vectors: List[str] | None = None # NAME=FILE
+    steering: bool = False
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
@@ -250,6 +252,11 @@ class ServerProcess:
         if self.lora_files:
             for lora_file in self.lora_files:
                 server_args.extend(["--lora", lora_file])
+        if self.steering_vectors:
+            for steering_vector in self.steering_vectors:
+                server_args.extend(["--steering-vector", steering_vector])
+        if self.steering:
+            server_args.append("--steering")
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
         if self.spec_type:

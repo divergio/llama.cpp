@@ -238,6 +238,24 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.lora = parse_lora_request(lora);
         }));
 
+    add((new field_json("steering"))
+        ->set_desc("Per-request activation steering: an object mapping registered steering vector names to scales, e.g. {\"hunger\": 0.6}. Only the generated tokens are steered, see STEERING.md")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & steering = data.at("steering");
+            if (steering.is_null()) {
+                return;
+            }
+            if (!steering.is_object()) {
+                throw std::invalid_argument("'steering' must be an object mapping steering vector names to scales");
+            }
+            for (const auto & [name, scale] : steering.items()) {
+                if (!scale.is_number()) {
+                    throw std::invalid_argument("steering scale of '" + name + "' must be a number");
+                }
+                ctx.params.steering[name] = scale.get<float>();
+            }
+        }));
+
     // sequence breakers for DRY
     // Currently, this is not compatible with TextGen WebUI, Koboldcpp and SillyTavern format
     // Ref: https://github.com/oobabooga/text-generation-webui/blob/d1af7a41ade7bd3c3a463bfa640725edb818ebaf/extensions/openai/typing.py#L39

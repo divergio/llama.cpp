@@ -39,6 +39,11 @@ json task_params::to_json(bool only_metrics) const {
         lora.push_back({{"id", it.first}, {"scale", it.second}});
     }
 
+    json steering_json = json::object();
+    for (const auto & [name, scale] : this->steering) {
+        steering_json[name] = scale;
+    }
+
     if (only_metrics) {
         return json {
             {"seed",                      sampling.seed},
@@ -83,6 +88,8 @@ json task_params::to_json(bool only_metrics) const {
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
+        {"steering",                  steering_json},
+            {"steering",                  steering_json},
         };
     }
 
@@ -142,6 +149,7 @@ json task_params::to_json(bool only_metrics) const {
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
+        {"steering",                  steering_json},
     };
 }
 
@@ -310,6 +318,26 @@ std::vector<unsigned char> completion_token_output::str_to_bytes(const std::stri
 // server_task_result_cmpl_final
 //
 json server_task_result_cmpl_final::to_json() {
+    json res = to_json_impl();
+
+    // steering echo, as an extra top-level key of the response (or of the last chunk when streaming)
+    if (!steering.is_null()) {
+        if (res.is_object()) {
+            res["steering"] = steering;
+        } else if (res.is_array() && !res.empty() && res.back().is_object()) {
+            json & last = res.back();
+            if (last.contains("data") && last.at("data").is_object()) {
+                last.at("data")["steering"] = steering;
+            } else {
+                last["steering"] = steering;
+            }
+        }
+    }
+
+    return res;
+}
+
+json server_task_result_cmpl_final::to_json_impl() {
     GGML_ASSERT(is_updated && "update() must be called before to_json()");
     switch (res_type) {
         case TASK_RESPONSE_TYPE_NONE:

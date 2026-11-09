@@ -3000,6 +3000,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--steering-vector"}, "NAME=FNAME",
+        "register a control vector file (llama-cvector-generator format) under NAME for per-request steering\n"
+        "the vectors are mixed per request with the \"steering\" field, see STEERING.md (can be repeated)",
+        [](common_params & params, const std::string & value) {
+            const auto pos = value.find('=');
+            if (pos == std::string::npos || pos == 0 || pos + 1 == value.size()) {
+                throw std::invalid_argument("steering-vector format: NAME=FNAME");
+            }
+            params.steering_vectors.push_back({ value.substr(0, pos), value.substr(pos + 1) });
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--steering"},
+        "enable per-request steering without startup vectors, so that vectors can be registered with POST /steering-vectors",
+        [](common_params & params) {
+            params.steering = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-a", "--alias"}, "STRING",
         "set model name aliases, comma-separated (to be used by API)",
         [](common_params & params, const std::string & value) {
