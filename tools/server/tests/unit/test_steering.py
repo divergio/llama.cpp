@@ -68,6 +68,7 @@ def make_server(steering: bool = True) -> ServerProcess:
     s.n_predict = N_PREDICT
     s.temperature = 0.0
     s.no_ui = True
+    s.jinja = True
     if steering:
         s.steering_vectors = [f"{n}={vectors[n]}" for n in ("hunger", "sleep")]
     return s
