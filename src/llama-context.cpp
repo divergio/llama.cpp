@@ -391,6 +391,10 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
+
+    if (params.cvec_seq && !cvec->init_seq(model, cparams.n_seq_max)) {
+        throw std::runtime_error("failed to allocate the per-sequence control vector tables");
+    }
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
@@ -1673,6 +1677,27 @@ bool llama_context::set_adapter_cvec(
     sched_need_reserve = true;
 
     return res;
+}
+
+bool llama_context::set_adapter_cvec_seq(
+              llama_seq_id   seq_id,
+               const float * data,
+                    size_t   len,
+                   int32_t   n_embd,
+                   int32_t   il_start,
+                   int32_t   il_end) {
+    LLAMA_LOG_DEBUG("%s: seq_id = %d, data = %p, il_start = %d, il_end = %d\n", __func__, seq_id, (const void *) data, il_start, il_end);
+
+    if (!cvec->has_seq()) {
+        LLAMA_LOG_ERROR("%s: per-sequence control vectors are not enabled for this context (cvec_seq = false)\n", __func__);
+        return false;
+    }
+
+    // the table may be in use by a graph that is still being computed
+    synchronize();
+
+    // note: the graph topology does not change, no need to re-reserve
+    return cvec->apply_seq(model, seq_id, data, len, n_embd, il_start, il_end);
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -4283,6 +4308,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.cvec_seq                    =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4655,6 +4681,19 @@ int32_t llama_set_adapter_cvec(
               int32_t   il_start,
               int32_t   il_end) {
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
+
+    return res ? 0 : -1;
+}
+
+int32_t llama_set_adapter_cvec_seq(
+        llama_context * ctx,
+         llama_seq_id   seq_id,
+          const float * data,
+               size_t   len,
+              int32_t   n_embd,
+              int32_t   il_start,
+              int32_t   il_end) {
+    bool res = ctx->set_adapter_cvec_seq(seq_id, data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
 }

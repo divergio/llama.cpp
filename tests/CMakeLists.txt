@@ -285,6 +285,18 @@ set_tests_properties(test-llama-context PROPERTIES
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
 )
 
+# per-sequence control vectors, Gemma 4 covers the output row cropping before the last layers
+llama_build(test-cvec-seq.cpp)
+llama_test(
+    test-cvec-seq
+    LABEL "main behavior"
+    ARGS -m "${MODEL_DIR}/gemma4-dense.gguf" -m "${MODEL_DIR}/llama-dense.gguf"
+)
+set_tests_properties(test-cvec-seq PROPERTIES
+    FIXTURES_REQUIRED generate-models
+    ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+)
+
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)

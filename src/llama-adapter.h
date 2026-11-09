@@ -27,6 +27,25 @@ struct llama_adapter_cvec {
             int32_t il_start,
             int32_t il_end);
 
+    // per-sequence control vectors
+    // table for layer il, F32 [n_embd, n_seq_max + 1], row 0 is always zero, row s + 1 belongs to sequence s
+    ggml_tensor * seq_tensor_for(int il) const;
+
+    bool has_seq() const { return !seq_tensors.empty(); }
+
+    // allocate the zero-initialized tables, changes the graph topology
+    bool init_seq(const llama_model & model, uint32_t n_seq_max);
+
+    // set (data != nullptr) or zero (data == nullptr) the row of sequence seq_id, only updates the table contents
+    bool apply_seq(
+            const llama_model & model,
+            llama_seq_id seq_id,
+            const float * data,
+            size_t len,
+            int32_t n_embd,
+            int32_t il_start,
+            int32_t il_end);
+
 private:
     bool init(const llama_model & model);
 
@@ -37,6 +56,13 @@ private:
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     std::vector<ggml_tensor *> tensors; // per layer
+
+    uint32_t seq_n_max = 0;
+
+    std::vector<ggml_context_ptr> seq_ctxs;
+    std::vector<ggml_backend_buffer_ptr> seq_bufs;
+
+    std::vector<ggml_tensor *> seq_tensors; // per layer
 };
 
 using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;

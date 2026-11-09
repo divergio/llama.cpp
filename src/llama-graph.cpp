@@ -380,6 +380,57 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_cvec_seq::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->n_tokens == n_tokens);
+
+    // row 0 of the table is zero: used for tokens shared by several sequences
+    auto row = [&](int64_t i) -> int32_t {
+        return ubatch->n_seq_id[i] == 1 ? ubatch->seq_id[i][0] + 1 : 0;
+    };
+
+    if (idx) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(idx->buffer));
+
+        int32_t * data = (int32_t *) idx->data;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            data[i] = row(i);
+        }
+    }
+
+    if (idx_out) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(idx_out->buffer));
+
+        int32_t * data_out = (int32_t *) idx_out->data;
+
+        // same order as llm_graph_input_out_ids
+        if (n_outputs == n_tokens) {
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                data_out[i] = row(i);
+            }
+        } else {
+            GGML_ASSERT(ubatch->output);
+
+            uint32_t n = 0;
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                if (ubatch->output[i]) {
+                    GGML_ASSERT(n < n_outputs);
+                    data_out[n++] = row(i);
+                }
+            }
+            GGML_ASSERT(n == n_outputs);
+        }
+    }
+}
+
+bool llm_graph_input_cvec_seq::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    res &= n_tokens  == params.ubatch.n_tokens;
+    res &= n_outputs == params.n_outputs;
+
+    return res;
+}
+
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
@@ -1607,7 +1658,68 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
-    return cvec->apply_to(ctx0, cur, il);
+    cur = cvec->apply_to(ctx0, cur, il);
+
+    ggml_tensor * table = cvec->seq_tensor_for(il);
+    if (table == nullptr) {
+        return cur;
+    }
+
+    if (inp_cvec_seq == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_cvec_seq>(n_tokens, n_outputs);
+        inp_cvec_seq = inp.get();
+        res->add_input(std::move(inp));
+    }
+
+    // the tokens are either the rows of cur, or dims 2-3 with several rows per token that all get the same
+    // vector (e.g. hyper-connection streams), like the broadcast of the global control vector
+    // some models crop the hidden state to the output tokens (inp_out_ids) before the last layers
+    const int64_t n_rows  = ggml_nrows(cur);
+    const int64_t n_outer = cur->ne[2]*cur->ne[3];
+
+    bool use_out = false;
+    bool per_row = true;
+    if (n_rows == n_tokens) {
+    } else if (n_outer == n_tokens) {
+        per_row = false;
+    } else if (n_rows == n_outputs) {
+        use_out = true;
+    } else if (n_outer == n_outputs) {
+        use_out = true;
+        per_row = false;
+    } else {
+        GGML_ABORT("per-sequence control vector: cannot match the shape of the hidden state to the tokens");
+    }
+
+    ggml_tensor * idx = nullptr;
+    if (!use_out) {
+        if (inp_cvec_seq->idx == nullptr) {
+            inp_cvec_seq->idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(inp_cvec_seq->idx);
+            ggml_set_name(inp_cvec_seq->idx, "inp_cvec_seq");
+        }
+        idx = inp_cvec_seq->idx;
+    } else {
+        if (inp_cvec_seq->idx_out == nullptr) {
+            inp_cvec_seq->idx_out = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+            ggml_set_input(inp_cvec_seq->idx_out);
+            ggml_set_name(inp_cvec_seq->idx_out, "inp_cvec_seq_out");
+        }
+        idx = inp_cvec_seq->idx_out;
+    }
+
+    ggml_tensor * dir = ggml_get_rows(ctx0, table, idx);
+    cb(dir, "cvec_seq", il);
+
+    if (per_row) {
+        if (!ggml_are_same_shape(dir, cur)) {
+            dir = ggml_reshape(ctx0, dir, cur);
+        }
+    } else {
+        dir = ggml_reshape_4d(ctx0, dir, cur->ne[0], 1, cur->ne[2], cur->ne[3]);
+    }
+
+    return ggml_add(ctx0, cur, dir);
 }
 
 ggml_tensor * llm_graph_context::build_hadamard_input(

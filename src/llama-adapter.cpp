@@ -30,7 +30,13 @@ ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur
     return cur;
 }
 
-bool llama_adapter_cvec::init(const llama_model & model) {
+// allocate one zero-initialized F32 [n_embd, ne1] tensor per layer, on the buffer type of that layer
+static bool llama_adapter_cvec_alloc(
+        const llama_model & model,
+        int64_t ne1,
+        std::vector<ggml_context_ptr> & ctxs,
+        std::vector<ggml_backend_buffer_ptr> & bufs,
+        std::vector<ggml_tensor *> & tensors) {
     const auto & hparams = model.hparams;
 
     GGML_ASSERT(tensors.empty());
@@ -72,7 +78,7 @@ bool llama_adapter_cvec::init(const llama_model & model) {
             LLAMA_LOG_ERROR("%s: failed to allocate context for control vector\n", __func__);
             return false;
         }
-        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
+        ggml_tensor * tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd, ne1);
         tensors.push_back(tensor);
     }
 
@@ -89,6 +95,29 @@ bool llama_adapter_cvec::init(const llama_model & model) {
         ggml_backend_buffer_clear(buf, 0);
         bufs.emplace_back(buf);
     }
+
+    return true;
+}
+
+bool llama_adapter_cvec::init(const llama_model & model) {
+    return llama_adapter_cvec_alloc(model, 1, ctxs, bufs, tensors);
+}
+
+bool llama_adapter_cvec::init_seq(const llama_model & model, uint32_t n_seq_max) {
+    if (!llama_adapter_cvec_alloc(model, (int64_t) n_seq_max + 1, seq_ctxs, seq_bufs, seq_tensors)) {
+        seq_tensors.clear();
+        seq_bufs.clear();
+        seq_ctxs.clear();
+        return false;
+    }
+
+    seq_n_max = n_seq_max;
+
+    size_t size = 0;
+    for (const auto & buf : seq_bufs) {
+        size += ggml_backend_buffer_get_size(buf.get());
+    }
+    LLAMA_LOG_INFO("%s: per-sequence control vector table: %u sequences, %.2f MiB\n", __func__, n_seq_max, size / 1024.0 / 1024.0);
 
     return true;
 }
@@ -129,6 +158,60 @@ bool llama_adapter_cvec::apply(
         const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
         if (off + n_embd <= len) {
             ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
+        }
+    }
+
+    return true;
+}
+
+ggml_tensor * llama_adapter_cvec::seq_tensor_for(int il) const {
+    if (il <= 0 || (size_t) il >= seq_tensors.size()) {
+        return nullptr;
+    }
+
+    return seq_tensors[il];
+}
+
+bool llama_adapter_cvec::apply_seq(
+        const llama_model & model,
+        llama_seq_id seq_id,
+        const float * data,
+        size_t len,
+        int32_t n_embd,
+        int32_t il_start,
+        int32_t il_end) {
+    const auto & hparams = model.hparams;
+
+    GGML_ASSERT(!seq_tensors.empty());
+
+    if (seq_id < 0 || (uint32_t) seq_id >= seq_n_max) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id %d (n_seq_max = %u)\n", __func__, seq_id, seq_n_max);
+        return false;
+    }
+
+    if (data != nullptr && n_embd != (int) hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: control vector n_embd does not match model\n", __func__);
+        return false;
+    }
+
+    const size_t row_size = hparams.n_embd*sizeof(float);
+    const size_t offs     = (size_t) (seq_id + 1)*row_size;
+
+    std::vector<float> zero;
+
+    for (size_t il = 1; il < hparams.n_layer(); il++) {
+        ggml_tensor * t = seq_tensors[il];
+
+        const size_t off = hparams.n_embd*(il - 1); // data starts at layer 1, same layout as apply()
+
+        const bool active = data != nullptr && (int) il >= il_start && (int) il <= il_end && off + hparams.n_embd <= len;
+        if (active) {
+            ggml_backend_tensor_set(t, data + off, offs, row_size);
+        } else {
+            if (zero.empty()) {
+                zero.resize(hparams.n_embd, 0.0f);
+            }
+            ggml_backend_tensor_set(t, zero.data(), offs, row_size);
         }
     }
 

@@ -269,6 +269,24 @@ public:
     const uint32_t n_outputs;
 };
 
+// per-sequence control vector row of each token, see llama_adapter_cvec::seq_tensor_for
+class llm_graph_input_cvec_seq : public llm_graph_input_i {
+public:
+    llm_graph_input_cvec_seq(int64_t n_tokens, uint32_t n_outputs) : n_tokens(n_tokens), n_outputs(n_outputs) {}
+    virtual ~llm_graph_input_cvec_seq() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // created on demand, depending on the number of rows that reach build_cvec()
+    ggml_tensor * idx     = nullptr; // I32 [n_tokens]
+    ggml_tensor * idx_out = nullptr; // I32 [n_outputs], idx of the output tokens (for layers cropped to inp_out_ids)
+
+    const int64_t  n_tokens;
+    const uint32_t n_outputs;
+};
+
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
@@ -1090,6 +1108,9 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // created on first use by build_cvec()
+    mutable llm_graph_input_cvec_seq * inp_cvec_seq = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

@@ -417,6 +417,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool cvec_seq;    // allocate per-sequence control vector tables, see llama_set_adapter_cvec_seq
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -742,6 +743,23 @@ extern "C" {
     // See llama_control_vector_load in common to load a control vector.
     LLAMA_API int32_t llama_set_adapter_cvec(
             struct llama_context * ctx,
+                     const float * data,
+                          size_t   len,
+                         int32_t   n_embd,
+                         int32_t   il_start,
+                         int32_t   il_end);
+
+    // Set the control vector of a single sequence, or if data is NULL, clear it.
+    // Same data layout and layer range semantics as llama_set_adapter_cvec. Layers outside
+    // [il_start, il_end] are zeroed for this sequence. The per-sequence vectors are added on top
+    // of the global control vector (if any). A token is steered by the vector of its sequence,
+    // tokens that belong to more than one sequence are not steered.
+    // Requires llama_context_params.cvec_seq = true, which allocates a [n_embd, n_seq_max + 1] F32 table
+    // per layer when the context is created. This call only updates the table contents, it does not
+    // change the graph and does not trigger a re-reserve.
+    LLAMA_API int32_t llama_set_adapter_cvec_seq(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
                      const float * data,
                           size_t   len,
                          int32_t   n_embd,
